@@ -1,0 +1,32 @@
+#!/bin/csh -f
+
+set loop_no = $1
+set input = $2
+
+# EXTRACT HYPOTHESES AND THEIR COMPRESSIONS FROM LOG
+
+#echo 'Hypotheses will be output to ' ${houtput}.pl
+#echo ' '
+
+# Calls a sed script which removes any newline and tab characters 
+# present in Prolog clauses output by Progol.
+# Grep selects those lines containing clauses which have positve compression.
+# Removes Progol trim around each compression value / clause pair.
+# Translate clause to form [Head,Body] 
+# Finally adds hypoth($loop_no, ) wrapper.
+
+
+sed -n -f ./one_line_clauses  ${input}  |\
+grep '\[C:[0-9]' |\
+sed 's/,[0-9]*,[0-9]*,[0-9]* /:/'  |\
+sed 's/^\[C://' |\
+sed 's/\.\]//'  |\
+sed 's/[ ]*:-[ ]*/:/' |\
+awk -F: '{ \
+if (NF == 3) \
+  {printf ("[%s, (%s)], %s\n", $2, $3, $1)} \
+else \
+  {printf ("[%s, (true)], %s\n", $2, $1)} \
+}'|\
+sed "s/^/hypoth(${loop_no}, /" |\
+sed 's/$/)./' #> all_compressions.pl

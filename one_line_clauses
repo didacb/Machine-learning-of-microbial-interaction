@@ -1,0 +1,39 @@
+#! /bin/csh -f
+
+##########################################################
+# 
+# This sed script removes the newline and tab characters which are
+# present in Prolog clauses output by Progol.
+# 
+# It should be called as follows:
+# 
+# sed -n -f one_line_clauses FILENAME
+# 
+# The script implements the following algorithm:
+# 
+# FOR each line in the input file
+#     1) IF the line does not end with a full-stop THEN
+# 	  remove the newline character from the end of this line
+# 	  remove the tab from the start of the next line
+# 	  goto 1
+#     2) Output the line
+# 
+# The following describes how each line works.
+# 
+# 1) label for branch statement
+# 2) matches lines without . at end
+# 3) appends next line to current line
+# 4) removes newline and tab
+# 5) branches to beginning of script
+# 6) prints out lines ending with .
+##########################################################
+
+:top
+/[^\.]$/{
+N
+s/\n	//g
+b top
+}
+p
+
+

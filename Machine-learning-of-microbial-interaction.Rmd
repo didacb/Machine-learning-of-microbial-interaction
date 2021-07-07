@@ -1,0 +1,716 @@
+---
+title: "Machine-learning-of-microbial-interaction"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r prepare table, eval=TRUE}
+#######################################################################################################
+#################################### Run together with SparCC ########################################
+#######################################################################################################
+
+git.folder<- "/home/didac/Desktop/microbiome_analysis/Machine-learning-of-microbial-interaction/"
+base.folder<- file.path(git.folder, "run")
+dir.create(base.folder)
+nperms<- 100
+folder<- character()
+for (i in c(2,3,5)){
+  folder<- c(folder, file.path(base.folder, paste0("str", i)))
+}
+partial.tabs<- lapply(c(2,3,5), function(x){ read.table(paste0("table-str", i, ".txt"))})
+Sys.setenv(Git_Folder=git.folder)
+
+Sys.setenv(OTU_VEC2=folder[[1]])
+Sys.setenv(OTU_VEC3=folder[[2]])
+Sys.setenv(OTU_VEC5=folder[[3]])
+
+```
+
+
+
+```{r prepare_Sparcc, eval=FALSE}
+
+for (i in seq_len(length(folder))){
+  dir.create(folder[i])
+  dir.create(file.path(folder[i], "table"))
+  cat("#OTU ID\t",file= file.path(folder[i], "table", "otutab.txt"))
+  write.table(partial.tabs[i], file.path(folder[i], "table", "otutab.txt"), quote = F, sep = "\t", append = T)
+
+}
+
+```
+
+
+```{r FastSpar run, eval=FALSE, engine='bash', message=FALSE, echo=FALSE, include=FALSE}
+#!/bin/bash
+  
+THREADS=4
+OTU_VEC=($OTU_VEC2 $OTU_VEC3 $OTU_VEC5)
+
+for OTU_PATH in ${OTU_VEC[@]};do
+  OTU=${OTU_PATH}/table/otutab.txt
+  cd ${OTU_PATH}
+  PREFIX=Sparcc
+  
+  mkdir -p ${PREFIX/-/\/}/bootstrap
+  cd ${PREFIX/-/\/}
+  #Correlations
+  fastspar  \
+  		 --otu_table ${OTU} \
+  		 --correlation cor.${PREFIX}.txt \
+  		 --covariance cov.${PREFIX}.txt \
+  		 --iterations 50 \
+  		 --threads $THREADS \
+  		 --yes
+  
+  # Ex: 10/B1/bootstrap
+  cd bootstrap
+  
+  echo "Starting bootstraps for ${PREFIX}"
+  # Bootstrap 
+  fastspar_bootstrap \
+  --otu_table ${OTU} \
+  -n 999 \
+  --prefix bt \
+  --threads $THREADS
+  
+  
+  # correlations for all bootstraps
+  for BOOT in `ls bt_*`;do
+  		fastspar --otu_table ${BOOT}  --correlation c_${BOOT} --covariance cv_${BOOT} -y -i 50 --threads ${THREADS} 2>> ../out.warning
+  done
+  
+  # Ex: 10/B1/
+  cd ..
+  
+  grep "row" out.warning |sort -u|awk -v threshold=${THRESHOLD} -v condition=${CONDITION} '{print threshold,condition,$1}' >> ../../otu_removed_unique_permutations
+  
+  echo "Starting pvalues for ${PREFIX}"
+  # Exact p-value estimation
+  fastspar_pvalues \
+  		--otu_table ${OTU} \
+  		--correlation cor.${PREFIX}.txt \
+  		--prefix bootstrap/c_bt_ \
+  		 -n 999 \
+  		 -o pval.${PREFIX}.txt \
+  		 --threads ${THREADS} 
+  
+  # remove bootstrap files
+  rm -Rf bootstrap
+  rm out.warning
+  # Ex: 10/B1/
+  
+  touch stop
+done  
+```
+
+
+```{r import_Sparcc, eval=FALSE}
+
+# Import correlation tables and pvalue 
+import_sparcc<-function(corr, pval,excluded_vertices=NULL){
+  m.sparcc<-as.matrix(read.table(corr,sep = "\t", header = F, row.names = 1))
+  colnames(m.sparcc)<-rownames(m.sparcc)
+  pval.sparcc<-as.matrix(read.table(pval, header = F, row.names = 1))
+  colnames(pval.sparcc)<-rownames(pval.sparcc)
+  
+  if(!is.null(excluded_vertices)){
+    m.sparcc<-m.sparcc[ ! rownames(m.sparcc) %in% excluded_vertices, !colnames(m.sparcc) %in% excluded_vertices]
+    pval.sparcc<-pval.sparcc[ ! rownames(pval.sparcc) %in% excluded_vertices, !colnames(pval.sparcc) %in% excluded_vertices]
+
+  }
+  
+  require(reshape2, quietly = T)
+  pval.sparcc.melt<-reshape2::melt(pval.sparcc, varnames = c('from_id', 'to_id'), value.name = "pval")
+  m.sparcc.melt<-reshape2::melt(m.sparcc, varnames = c('from_id', 'to_id'), value.name = "corr")
+  
+  # Merge Correlation and pvalues
+  sparcc.df<-merge(m.sparcc.melt, pval.sparcc.melt)
+  
+  # Remove X prefix if OTU hash started by numeric
+  sparcc.df$from_id<-gsub("X","",sparcc.df$from_id)
+  sparcc.df$to_id<-gsub("X","",sparcc.df$to_id)
+  return(sparcc.df)
+}
+sparcc.dfs<-list()
+for (i in seq_len(length(folder))){
+  sparcc.df<- import_sparcc(file.path(folder[i], "Sparcc", paste0("cor.", "Sparcc",".txt")),
+                          file.path(folder[i], "Sparcc", paste0("pval.", "Sparcc",".txt")))
+
+  sparcc.df.filt<- sparcc.df[sparcc.df$pval<0.05,]
+  sparcc.df.filt$corr<- ifelse(sparcc.df.filt$corr>0, "+", "-")
+  colnames(sparcc.df.filt)<- c("sp1", "sp2", "lnk", "value")
+  sparcc.dfs[[i]]<- list(sparcc.df, sparcc.df.filt)
+}
+```
+
+```{r prepare_Progol, warning=FALSE, message=FALSE, echo=FALSE, eval=FALSE}
+###################################################################
+################### Function to test pairs #######################
+##################################################################
+#Function to apply chisq test to all replicate comparison for one species and obtain the abundance progol input
+abundanceChi<- function(comparisons, asv.table, spec, samps, read.depth){
+  #Detect the pair of values and depth to compare
+  pair<- asv.table[spec, comparisons]
+  depth<- read.depth[comparisons]
+  #If almost one of the pair values is no zero and the samples are not equal to depth 
+  if (all(pair != 0) & any(pair != depth)){
+    #Make table and add margins
+    tab<- as.matrix(rbind(pair, depth - pair))
+    tab<- addmargins(A=tab, margin= seq_along(dim(tab)))
+    #Do the test  
+    
+    test<- chisq.test(tab)
+    if (test$p.value < 0.01){
+      #If it is significant stablish the up and down 
+      if (pair[1] < pair[2]){
+        up.down<- "up"
+      } else {
+        up.down<- "down"
+      }
+      #Build progol abundance input
+      abundance.unit<- paste0("abundance(", samps[comparisons[1]], ",", samps[comparisons[2]], ",", paste0("s", spec), ",", up.down, ").")
+    } else {
+      abundance.unit<- paste0("abundance(", samps[comparisons[1]], ",", samps[comparisons[2]], ",", paste0("s", spec), ",zero).")
+      
+    } 
+  } else {
+    abundance.unit<- NULL
+    
+  }
+  return(abundance.unit)
+}
+
+###########################################################################
+################Format tables #############################################
+###########################################################################
+for (l in 1:3) {
+    
+  asv.table<- partial.tabs[[l]]
+  
+  #Format tables
+  sequences<- rownames(asv.table)
+  names.samples<- colnames(asv.table)
+  specs<- paste0("s", seq_len(nrow(asv.table)))
+  samps<- paste0("c", seq_len(ncol(asv.table)))
+  #Obtain read depth
+  read.depth<- colSums(asv.table)
+  
+  
+  ############################################################################
+  ############# Build Abundance ##############################################
+  ############################################################################
+  selected.samples<- rep(TRUE, ncol(asv.table))
+  comparisons<- combn(which(selected.samples), 2, NULL, FALSE)
+  double.directions<- TRUE
+  if (double.directions){
+    other.direction<- lapply(comparisons, function(x){c(x[2], x[1])})
+    comparisons<- c(comparisons, other.direction)
+  }  
+  
+  #Run pairwise test function for all species
+  abundance<- list()
+  for (i in seq_len(length(specs))){
+    abundance.specie<- sapply(comparisons, abundanceChi, asv.table, i, samps, read.depth)
+    abundance[[i]]<- abundance.specie
+  }
+  abundance<- unlist(abundance)
+  
+  presence<- character()
+  for (m in seq_len(nrow(asv.table))){
+    yes.no<- ifelse(asv.table[m,]>0, "yes", "no")
+    presence<- c(presence, paste0("presence(",samps, ",", 
+                                  specs[m],
+                                  ",", unname(yes.no), ")."))
+    
+  }
+  pairs.species<- combn(seq_len(nrow(asv.table)), 2, NULL, FALSE)
+  other.direction<- lapply(pairs.species, function(x){c(x[2], x[1])})
+  pairs.species<- c(pairs.species, other.direction)
+  cooc<- lapply(pairs.species, function(p){
+      bolean.oc<- asv.table[p[1],]>0 & asv.table[p[2],]>0
+      if(any(bolean.oc)){
+        return(paste0("co_occurrence(c", which(bolean.oc), ",s", p[1], ",s", p[2], ")." ))
+      } else {
+        return(NULL)
+      }
+  })
+  cooc<- unlist(cooc)
+  
+  progol.folder<- file.path(folder[l], "progol") 
+  dir.create(progol.folder)
+  partial.abundance <- abundance
+  species<- strsplit(partial.abundance, split = ",")
+  species<- sapply(species, function(x){x[3]})
+  species.learn<- paste0("species(", unique(species), ").")
+  for (i in seq_len(nperms)){
+    ####### WRITE FOLDER
+    dir.create(file.path(progol.folder, i))
+    #Abundance
+    mix<- sample(partial.abundance)
+    writeLines(mix, file.path(progol.folder, i, "abundance.pl"))
+    abundance1 <- gsub('abundance','abundance1', mix)
+    writeLines(abundance1, file.path(progol.folder, i,"abundance1.pl"))
+    #Presence
+    pmix<- sample(presence)
+    writeLines(pmix, file.path(progol.folder, i, "presence.pl"))
+    writeLines(gsub("presence", "presence1", pmix), file.path(progol.folder, i, "presence1.pl"))
+    #Others
+    writeLines(species.learn, file.path(progol.folder, i, "species.pl"))
+    writeLines(cooc, file.path(progol.folder, i, "co_occurrence.pl"))
+    writeLines(gsub("rrence", "rrence1", cooc), file.path(progol.folder, i, "co_occurrence1.pl"))
+    write.table(asv.table, file.path(progol.folder, i, "table.txt"))  
+  }
+}  
+```
+
+```{r run_Progol, eval=FALSE, engine='bash'}
+#!/bin/bash
+OTU_VEC=($OTU_VEC2 $OTU_VEC3 $OTU_VEC5)
+
+for OTU_PATH in ${OTU_VEC[@]}
+  do
+  cd $OTU_PATH/progol
+  for d in */; do cp $Git_Folder/learn_relation.pl "$d"; done 
+  ALL_PATH=$OTU_PATH/progol
+  export ALL_PATH
+  ls -d * | parallel -j 10 "(cd $ALL_PATH/{}; progol learn_relation.pl > progol{}.txt)"
+  cd ..
+done
+  
+```
+
+
+
+```{r post_Progol, eval=TRUE, cache=FALSE}    
+library(parallel)
+library(reshape2)
+library(ggplot2)
+library(plyr)
+library(pROC)
+setwd(git.folder)
+importCompression<- function(folder, nperm, in.func, internal.absolute){
+  perm.directories<- list.dirs(file.path(folder,"progol"), recursive = FALSE)
+  perm.directories<- perm.directories[order(as.numeric(basename(perm.directories)))]
+  selected.dirs<- sample(length(perm.directories), nperm)
+  setwd(git.folder)
+  
+  for (i in selected.dirs){
+    
+    filename<- file.path(perm.directories[i], paste0("progol",  i, ".txt"))
+    fileout<- file.path(perm.directories[i], paste0("compressions",  i, ".txt"))
+    
+    arguments<- paste0("1 ", filename, " > ", fileout)
+    #system2("./extract_hypoth_compres", args = arguments)
+    # Transform compressions in a table 
+    compresion.table<- read.table(fileout, sep = ",")
+    
+    #Give format to table elemenst from compressions string
+    sp1<- sapply(strsplit(x =  as.character(compresion.table$V2), 
+                          split = "(", fixed = TRUE), function(specie1) specie1[2])
+    sp2<- sapply(strsplit(x =  as.character(compresion.table$V3), 
+                          split = ")", fixed = TRUE), function(specie2) specie2[1])
+    comp<- as.numeric(sapply(strsplit(x =  as.character(compresion.table$V5), split = ").", 
+                                      fixed = TRUE), function(compresions) compresions[1]))
+    lnk.part<- sapply(strsplit(x =  as.character(compresion.table$V2), split = "(s", fixed = TRUE), function(specie2) specie2[1])
+    lnk<- sapply(strsplit(x =  as.character(lnk.part), " [", fixed = TRUE), function(specie2) specie2[2])
+    file.df<- data.frame(sp1, sp2, lnk, comp, stringsAsFactors = FALSE)
+    file.df<- do.call(in.func, list(file.df))
+    if(internal.absolute){
+      file.df<- ddply(file.df, .(sp1, sp2), summarise, lnk = lnk[comp == max(comp)][1], comp = if(length(comp)>1){
+        max(comp) - min(comp)}else{comp}) 
+    }
+    
+    
+    if(i==selected.dirs[1]){
+      join.table<- file.df
+    }else{
+      join.table<- rbind(join.table, file.df)
+    }  
+  }
+  return(join.table)
+}
+
+##############################################################################################################
+############################ Normalise Relation ##############################################################
+###########################################################################################################
+normaliseCompression<- function(rel.table, folder){
+  rel.table<- rel.table[rel.table$sp1 !=  rel.table$sp2,]
+  presence<- strsplit(x =  readLines(file.path(folder,"progol",1, "presence.pl")), split = ",")
+  
+  yes.no<- gsub(").", "", sapply(presence, function(x){x[3]}))
+  samp<- gsub("presence\\(", "", sapply(presence, function(x){x[1]}))
+  spec<- sapply(presence, function(x){x[2]})
+  no.table<- table(paste0(spec, yes.no))
+  
+  spec<- spec[yes.no == "yes"]
+  samp<- samp[yes.no == "yes"]
+  
+  cooc<- character()
+  for (z in seq_len(length(unique(samp)))){
+    
+    sm<- samp[samp==unique(samp)[z]]
+    if (length(sm)>1){
+      sm.spec<- spec[samp ==sm[1]]
+      cmb<-t(combn(sm.spec, 2))
+      cooc<- c(cooc, paste(cmb[,1], cmb[,2], sep = ""), paste(cmb[,2], cmb[,1], sep = ""))
+    }
+  }
+  coo.tab<- table(cooc)
+  rel.table$comp<- apply(rel.table, 1, function(x){ as.numeric(x[4])*abs(log(coo.tab[paste0(x[1],x[2])] / no.table[paste0(x[1], "no")]))})
+  rel.table$comp[is.na(rel.table$comp)]<- 0
+  return(rel.table)
+}
+
+###############################################################################################################
+############################# Reorder and check repeated functions ##########################################
+#############################################################################################################
+reOrder<- function(rel.table){
+  df<- data.frame(as.numeric(gsub("s", "", rel.table[,1])), as.numeric(gsub("s", "", rel.table[,2])))
+  df<- t(apply(df, 1, function(x){
+    if (x[1] < x[2]){
+      return(c(paste0("s", x[1]), paste0("s",x[2])))
+    }else{
+      return(c(paste0("s", x[2]), paste0("s",x[1])))}}))
+  rel.table.reord<- data.frame(df, rel.table[,3:4])
+  colnames(rel.table.reord)<- c("sp1", "sp2","lnk", "comp")
+  return(rel.table.reord)
+}
+
+
+checkRepeated<- function(df){
+  #Keep highest compression
+  colnames(df)<- c("First", "Second", "Compression", "Link")
+  df<- ddply(df, .(First, Second), summarise, Compression = max(Compression), 
+             Link = Link[Compression==max(Compression)][1])
+  
+  #Check other direction
+  tag1<- paste0(df[,1], df[,2])
+  tag2<- paste0(df[,2], df[,1])
+  delete<- numeric()
+  for (i in seq_len(length(tag1))) {
+    x<- tag1[i]
+    repeated<- which(tag1 %in% x | tag2 %in% x)
+    delete<- c(delete, repeated[df[repeated,3] != max(df[repeated,3])]) 
+  }  
+  if (length(delete)> 0){
+    df<- df[-unique(delete),]
+  }
+  rownames(df)<- NULL
+  return(df)
+}
+
+
+assignCorrelation<- function(correct.df, inference.df, value.column){
+  rel.table.reord<- reOrder(inference.df)
+  for (i in seq_len(nrow(correct.df))){
+    if(any(paste0(rel.table.reord$sp1, rel.table.reord$sp2) %in% paste0(correct.df$sp1, correct.df$sp2)[i])){ 
+      correct.df[i,4]<- max(rel.table.reord[paste0(rel.table.reord$sp1, rel.table.reord$sp2) == paste0(correct.df$sp1, correct.df$sp2)[i], value.column])
+    }
+  }
+  return(correct.df)
+}
+#############Correct values#####################################################
+sp1<- character()
+sp2<- character()
+for (i in 1:16){
+  sp1<- c(sp1, paste0("s", i*2-1))
+  sp2<- c(sp2, paste0("s", i*2))
+}
+
+rels.df<- data.frame(sp1, sp2, rep("all",16))#rels.name)
+colnames(rels.df)<- c("sp1", "sp2", "lnk")
+correct.tag<- unname(apply(rels.df[,1:2], 1, function(x){paste0(x, collapse = "")}))
+
+correct<- data.frame(t(combn(paste0("s",seq_len(32)),2)))
+correct<- cbind(correct, ifelse(paste0(correct[,1], correct[,2]) %in% correct.tag, "Yes", "No"), rep(0, nrow(correct)))
+colnames(correct)<- c("sp1", "sp2", "response", "value")
+########################################################################################
+############################ ROC #######################################################
+########################################################################################
+
+
+getAUC<- function(ntimes, folder, func, int.func, int.abs){
+  
+  aucs<- lapply(ntimes, function(np){
+    rel.table<- importCompression(folder, np, int.func, int.abs)
+    rel.table<- normaliseCompression(rel.table, folder)
+    rel.table<- do.call(func, list(rel.table))   
+    rel.table<- ddply(rel.table, .(sp1, sp2), summarise, lnk = lnk[comp == max(comp)][1], comp = if(length(comp)>1){
+      max(comp) - min(comp)}else{comp})
+    tab.assigned<- assignCorrelation(correct, rel.table, 4)
+    roc.curve<- roc(tab.assigned$response, tab.assigned$value)
+    aucs<-  auc(roc.curve)
+    return(aucs)
+  })
+  return(unlist(aucs))
+}
+
+max.fun<- function(rel.table){
+      rel.table<- ddply(rel.table, .(sp1, sp2, lnk), summarise, comp=max(comp))
+      return(rel.table)
+}
+
+sum.fun<- function(rel.table){
+  rel.table<- ddply(rel.table, .(sp1, sp2, lnk), summarise, comp=sum(comp))
+  return(rel.table)
+}
+
+freq.fun<- function(rel.table){
+  rel.table<- ddply(rel.table, .(sp1, sp2, lnk), summarise, comp=(length(comp)))
+  return(rel.table)
+}
+
+doNothing<- function(rel.table){return(rel.table)}
+
+
+ntimes<- c(rep(1, 25), rep(5, 25), rep(10, 25), rep(25, 25), rep(50, 25))
+pt<- list()
+for (i in 1:3) {
+  
+  max.aucs<- getAUC(ntimes, folder[i], max.fun, doNothing, FALSE)
+  sum.aucs<- getAUC(ntimes, folder[i], sum.fun, doNothing, FALSE)
+  freq.aucs<- getAUC(ntimes, folder[i], freq.fun, sum.fun, FALSE)
+  int.sum.aucs<- getAUC(ntimes, folder[i], max.fun, sum.fun, TRUE)
+  
+  aucs<- list(max.aucs, sum.aucs, freq.aucs, int.sum.aucs)
+  
+  #######################################################3
+  ############## Plot ####################################
+  ######################################################
+  means.auc<-lapply(aucs, function(auc.single){
+    sapply(unique(ntimes), function(x){
+      mean(auc.single[ntimes==x])
+  })})
+  
+  sd.auc<- lapply(aucs, function(auc.single){
+    sapply(unique(ntimes), function(x){
+      sd.val<-sd(auc.single[ntimes==x])
+      if(is.na(sd.val)){
+        sd.val<-0
+      }
+      return(sd.val)
+  })})
+  names(means.auc)<- c("Maximum comp", "Sum comp", "HFE", "Independent" )
+  names(sd.auc)<- c("Maximum comp", "Sum comp", "HFE", "Independent" )
+  df<- data.frame(rep(unique(ntimes),4), melt(means.auc), melt(sd.auc)[,1])
+  
+  colnames(df)<- c("n_perms", "mean_AUC", "comp_form", "sd_AUC")
+  df$comp_form<- as.factor(df$comp_form)
+  if (i != 3){
+    pt[[i]]<- ggplot(df, aes(x = n_perms, y = mean_AUC, color = comp_form, shape = comp_form))+ geom_point(size=2)+ ylim(c(0.5,1))+ geom_line(aes(linetype = comp_form))+
+    geom_errorbar(aes(ymin=mean_AUC-sd_AUC, ymax=mean_AUC+sd_AUC), width=3, size=0.5)+ scale_shape_manual(values = c(15,16,17,8))+
+    theme(legend.position= "none", panel.background = element_rect(fill = "white",color = "black"), 
+          panel.grid.minor = element_blank(), panel.grid.major = element_blank(), legend.title = element_blank())+
+    ylab("AUC Mean")+xlab("Number of Permutations")+
+    labs(color  = "Function", linetype = "Function", shape = "Function")+
+    scale_color_manual(values =c("black", "red", "blue", "Brown"))
+  } else{
+    pt[[i]]<- ggplot(df, aes(x = n_perms, y = mean_AUC, color = comp_form, shape = comp_form))+ geom_point(size=2)+ ylim(c(0.5,1))+ geom_line(aes(linetype = comp_form))+
+      geom_errorbar(aes(ymin=mean_AUC-sd_AUC, ymax=mean_AUC+sd_AUC), width=3, size=0.5)+scale_shape_manual(values = c(15,16,17,8))+
+      theme(legend.position = "bottom", panel.background = element_rect(fill = "white",color = "black"), 
+            panel.grid.minor = element_blank(), panel.grid.major = element_blank(), legend.title = element_blank())+
+      ylab("AUC Mean")+xlab("Number of Permutations")+
+      labs(color  = "Function", linetype = "Function", shape = "Function")+
+      scale_color_manual(values =c("black", "red", "blue", "Brown"))
+  }
+  message(i)
+}
+nms<- c("Strength 2", "Strength 3", "Strength 5")
+library(cowplot)
+pdf("~/Desktop/AUCvsNPerm.pdf", width = 4.8, height = 6.77, family = "Times", pointsize = 12)
+ plot_grid(pt[[1]], pt[[2]], pt[[3]], nrow = 3, labels = nms, label_x = 0.02, label_y = 0.98, rel_heights = c(1,1,1.3))
+dev.off()
+
+```
+
+```{r Select}
+#############################################################################################################
+############################# Bootstrap ##################################################################
+################################################################################################ ################
+library(boot)
+boot.fun<- function(df, i){
+  df1<- df
+  #Randomise link 
+  df1[,5]<- df1[i,5]
+  
+  df1<- df1[df1[,5]=="yes",] 
+  up<- df1[df1[,3]=="effect_up",4]
+  dn<- df1[df1[,3]=="effect_down",4]
+  if(length(up)==0){
+    up<-0
+  }else{
+    up<- max(up)
+  }
+  if(length(dn)==0){
+    dn<-0
+  }else{
+    dn<- max(dn)
+  }
+  return(up-dn)
+}
+
+
+bootstrapCompression<- function(rel.table){
+  boot.tag<- paste(rel.table[,1], rel.table[,2], sep = "-")
+  set.seed(1899)
+  pvals<- lapply(sort(unique(boot.tag)), function(x){
+    sp1<- sapply(strsplit(x, split = "-"), function(y){y[1]}) 
+    sp2<- sapply(strsplit(x, split = "-"), function(y){y[2]}) 
+    
+    rl<- rel.table[rel.table$sp1 %in% c(sp1,sp2) | rel.table$sp2 %in% c(sp2,sp1),] 
+    
+
+    tag<- paste(rl[,1], rl[,2], sep = "-")                  
+
+    rl<- cbind(rl, ifelse(tag==x, "yes", "no"))
+    colnames(rl)<- c("sp1","sp2", "lnk", "comp", "correct")
+    bt<- boot(data = rl, statistic = boot.fun, R = 999, sim = "ordinary",parallel = "no")
+
+    if(bt$t0 < 0){
+      pval<- mean(bt$t < bt$t0)  
+    }else{
+      pval<- mean(bt$t > bt$t0)
+    }
+    names(pval)<- x
+    return(pval)
+  })
+  pvals<- unlist(pvals)
+  significant.rels<- names(which(pvals<0.05))
+
+  return(significant.rels)
+}
+
+
+bootstrapCompressionStrata<- function(rel.table){
+  boot.tag<- paste(rel.table[,1], rel.table[,2], sep = "-")
+  set.seed(1899)
+  pvals<- lapply(sort(unique(boot.tag)), function(x){
+    sp1<- sapply(strsplit(x, split = "-"), function(y){y[1]}) 
+    sp2<- sapply(strsplit(x, split = "-"), function(y){y[2]}) 
+    
+    rl<- rel.table[rel.table$sp1 %in% c(sp1,sp2) | rel.table$sp2 %in% c(sp2,sp1),] 
+
+    tag<- paste(rl[,1], rl[,2], sep = "-")                  
+
+    rl<- cbind(rl, ifelse(tag==x, "yes", "no"))
+    colnames(rl)<- c("sp1","sp2", "lnk", "comp", "correct")
+    bt<- boot(data = rl, statistic = boot.fun, R = 999, sim = "ordinary",parallel = "no" , strata = ifelse(rl$lnk == "effect_up", 1, 2))
+
+    if(bt$t0 < 0){
+      pval<- mean(bt$t < bt$t0)  
+    }else{
+      pval<- mean(bt$t > bt$t0)
+    }
+    names(pval)<- x
+    return(pval)
+  })
+  pvals<- unlist(pvals)
+  significant.rels<- names(which(pvals<0.05))
+
+  return(significant.rels)
+}
+
+GetOptimalThreshold<- function(rel.table){
+  rel.table<- do.call(max.fun, list(rel.table))   
+  rel.table<- ddply(rel.table, .(sp1, sp2), summarise, lnk = lnk[comp == max(comp)][1], comp = if(length(comp)>1){
+    max(comp) - min(comp)}else{comp})
+  tab.assigned<- assignCorrelation(correct, rel.table, 4)
+  roc.curve<- roc(tab.assigned$response, tab.assigned$value)
+  opt <- as.numeric(coords(roc=roc.curve,"best", transpose = FALSE)[1])
+}
+
+##############################################################
+################# Plot Interactions #########################
+##############################################################
+############################################################
+######## Filter #########################################
+############################################################
+rel.tables<- lapply(folder, function(fold){
+  rel.table<- importCompression(fold, 100, doNothing, FALSE)
+  rel.table<- normaliseCompression(rel.table, fold)})
+
+
+significant.rels<- lapply(rel.tables, bootstrapCompression)
+significant.rels.strata<- lapply(rel.tables, bootstrapCompressionStrata)
+optimal.thresholds<- lapply(rel.tables, GetOptimalThreshold)
+
+rel.table.filt<- list()
+rel.table.filt.strata<- list()
+rel.table.filt.opt<- list()
+for (i in seq_len(length(rel.tables))){
+  rel.table<- rel.tables[[i]]
+  rel.table<- do.call(max.fun, list(rel.table))   
+  rel.table<- ddply(rel.table, .(sp1, sp2), summarise, lnk = lnk[comp == max(comp)][1], comp = if(length(comp)>1){
+    max(comp) - min(comp)}else{comp})
+  rel.table.tag<- paste(rel.table[,1], rel.table[,2], sep = "-")
+  rel.table.filt[[i]]<- rel.table[rel.table.tag %in% significant.rels[[i]],]
+  rel.table.filt[[i]]<- ddply(rel.table.filt, .(sp1, sp2, lnk), summarise, comp=max(comp)) 
+  
+  rel.table.filt.strata[[i]]<- rel.table[rel.table.tag %in% significant.rels.strata[[i]],]
+  rel.table.filt.strata[[i]]<- ddply(rel.table.filt.strata, .(sp1, sp2, lnk), summarise, comp=max(comp)) 
+  
+  rel.table.filt.opt[[i]]<- rel.table[rel.table$comp > optimal.thresholds[[i]],]
+  
+ 
+}
+
+
+
+
+```
+
+```{r stat, eval=FALSE}
+getStats<- function(tab, correct.tag, total.links){
+  tags<- unique(paste0(reOrder(tab)[,1], reOrder(tab)[,2]))
+  tot<- length(tags)
+  tp<- length(which(correct.tag %in% tags))
+  fp<- length(which(!tags %in% correct.tag))
+  fn<- length(correct.tag)-tp
+  tn<- total.links-length(correct.tag)-fp
+  sens<- round(tp/(tp+fn),3)
+  spec<- round(tn/(tn+fp),3)
+  acc<- round((tp+tn)/total.links,3)
+  joined<- c(tot,tp,fp,tn,fn,sens,spec,acc)
+  return(joined)
+}
+
+total.links<- nrow(partial.tabs[[1]]) * (nrow(partial.tabs[[1]])-1) /2
+
+
+tab.final2<- cbind(getStats(rel.table.filt.opt[[1]], correct.tag, total.links),
+                   getStats(rel.table.filt[[1]], correct.tag, total.links),
+                   getStats(rel.table.filt.strata[[1]], correct.tag, total.links),
+                   getStats(sparcc.dfs[[1]][[2]], correct.tag, total.links),
+                   
+tab.final2<- rbind(c("Strength 2", "", "", ""),c("Optimal", "ILP", "ILP-strata", "SparCC"),tab.final2) 
+rownames(tab.final2)<- c("", "", "total", "TP", "FP", "TN", "FN", "Sensivity", "Especificity", "Accuracy")
+
+tab.final3<- cbind(getStats(rel.table.filt.opt[[2]], correct.tag, total.links),
+                   getStats(rel.table.filt[[2]], correct.tag, total.links),
+                   getStats(rel.table.filt.strata[[2]], correct.tag, total.links),
+                   getStats(sparcc.dfs[[2]][[2]], correct.tag, total.links),
+  
+tab.final3<- rbind(c("Strength 3", "", "", ""),c("Optimal", "ILP", "ILP-strata", "SparCC"),tab.final3) 
+rownames(tab.final3)<- c("", "", "total", "TP", "FP", "TN", "FN", "Sensivity", "Especificity", "Accuracy")
+
+tab.final5<- cbind(getStats(rel.table.filt.opt[[3]], correct.tag, total.links),
+                   getStats(rel.table.filt[[3]], correct.tag, total.links),
+                   getStats(rel.table.filt.strata[[3]], correct.tag, total.links),
+                   getStats(sparcc.dfs[[3]][[2]], correct.tag, total.links),
+  
+tab.final5<- rbind(c("Strength 5", "", "", ""),c("Optimal", "ILP", "ILP-strata", "SparCC"),tab.final5) 
+rownames(tab.final5)<- c("", "", "total", "TP", "FP", "TN", "FN", "Sensivity", "Especificity", "Accuracy")
+
+tab.final<- rbind(tab.final2, tab.final3, tab.final5)
+
+write.table(tab.final, file.path(base.folder, paste0("inference_stats.txt")), quote = FALSE, col.names = FALSE, )
+tab.final
+```
+
+
+
+
