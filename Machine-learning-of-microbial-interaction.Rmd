@@ -9,10 +9,10 @@ knitr::opts_chunk$set(echo = TRUE)
 
 ```{r prepare table, eval=TRUE}
 #######################################################################################################
-#################################### Run together with SparCC ########################################
+#################################### Create folders and import tables ########################################
 #######################################################################################################
 
-git.folder<- "/home/didac/Desktop/microbiome_analysis/Machine-learning-of-microbial-interaction/"
+git.folder<- "~/Machine-learning-of-microbial-interaction"
 base.folder<- file.path(git.folder, "run")
 dir.create(base.folder)
 nperms<- 100
@@ -20,7 +20,7 @@ folder<- character()
 for (i in c(2,3,5)){
   folder<- c(folder, file.path(base.folder, paste0("str", i)))
 }
-partial.tabs<- lapply(c(2,3,5), function(x){ read.table(paste0("table-str", i, ".txt"))})
+partial.tabs<- lapply(c(2,3,5), function(x){ read.table(paste0("table-str", x, ".txt"))})
 Sys.setenv(Git_Folder=git.folder)
 
 Sys.setenv(OTU_VEC2=folder[[1]])
@@ -31,7 +31,7 @@ Sys.setenv(OTU_VEC5=folder[[3]])
 
 
 
-```{r prepare_Sparcc, eval=FALSE}
+```{r prepare_Sparcc, eval=TRUE}
 
 for (i in seq_len(length(folder))){
   dir.create(folder[i])
@@ -44,7 +44,7 @@ for (i in seq_len(length(folder))){
 ```
 
 
-```{r FastSpar run, eval=FALSE, engine='bash', message=FALSE, echo=FALSE, include=FALSE}
+```{r FastSpar run, eval=TRUE, engine='bash', message=FALSE, echo=FALSE, include=FALSE}
 #!/bin/bash
   
 THREADS=4
@@ -108,7 +108,7 @@ done
 ```
 
 
-```{r import_Sparcc, eval=FALSE}
+```{r import_Sparcc, eval=TRUE}
 
 # Import correlation tables and pvalue 
 import_sparcc<-function(corr, pval,excluded_vertices=NULL){
@@ -147,7 +147,7 @@ for (i in seq_len(length(folder))){
 }
 ```
 
-```{r prepare_Progol, warning=FALSE, message=FALSE, echo=FALSE, eval=FALSE}
+```{r prepare_Progol, warning=FALSE, message=FALSE, echo=FALSE, eval=TRUE}
 ###################################################################
 ################### Function to test pairs #######################
 ##################################################################
@@ -267,7 +267,7 @@ for (l in 1:3) {
 }  
 ```
 
-```{r run_Progol, eval=FALSE, engine='bash'}
+```{r run_Progol, eval=TRUE, engine='bash'}
 #!/bin/bash
 OTU_VEC=($OTU_VEC2 $OTU_VEC3 $OTU_VEC5)
 
@@ -304,7 +304,7 @@ importCompression<- function(folder, nperm, in.func, internal.absolute){
     fileout<- file.path(perm.directories[i], paste0("compressions",  i, ".txt"))
     
     arguments<- paste0("1 ", filename, " > ", fileout)
-    #system2("./extract_hypoth_compres", args = arguments)
+    system2("./extract_hypoth_compres", args = arguments)
     # Transform compressions in a table 
     compresion.table<- read.table(fileout, sep = ",")
     
@@ -623,9 +623,6 @@ GetOptimalThreshold<- function(rel.table){
   opt <- as.numeric(coords(roc=roc.curve,"best", transpose = FALSE)[1])
 }
 
-##############################################################
-################# Plot Interactions #########################
-##############################################################
 ############################################################
 ######## Filter #########################################
 ############################################################
@@ -663,7 +660,7 @@ for (i in seq_len(length(rel.tables))){
 
 ```
 
-```{r stat, eval=FALSE}
+```{r stat, eval=TRUE}
 getStats<- function(tab, correct.tag, total.links){
   tags<- unique(paste0(reOrder(tab)[,1], reOrder(tab)[,2]))
   tot<- length(tags)
@@ -684,7 +681,7 @@ total.links<- nrow(partial.tabs[[1]]) * (nrow(partial.tabs[[1]])-1) /2
 tab.final2<- cbind(getStats(rel.table.filt.opt[[1]], correct.tag, total.links),
                    getStats(rel.table.filt[[1]], correct.tag, total.links),
                    getStats(rel.table.filt.strata[[1]], correct.tag, total.links),
-                   getStats(sparcc.dfs[[1]][[2]], correct.tag, total.links),
+                   getStats(sparcc.dfs[[1]][[2]], correct.tag, total.links))
                    
 tab.final2<- rbind(c("Strength 2", "", "", ""),c("Optimal", "ILP", "ILP-strata", "SparCC"),tab.final2) 
 rownames(tab.final2)<- c("", "", "total", "TP", "FP", "TN", "FN", "Sensivity", "Especificity", "Accuracy")
@@ -692,7 +689,7 @@ rownames(tab.final2)<- c("", "", "total", "TP", "FP", "TN", "FN", "Sensivity", "
 tab.final3<- cbind(getStats(rel.table.filt.opt[[2]], correct.tag, total.links),
                    getStats(rel.table.filt[[2]], correct.tag, total.links),
                    getStats(rel.table.filt.strata[[2]], correct.tag, total.links),
-                   getStats(sparcc.dfs[[2]][[2]], correct.tag, total.links),
+                   getStats(sparcc.dfs[[2]][[2]], correct.tag, total.links))
   
 tab.final3<- rbind(c("Strength 3", "", "", ""),c("Optimal", "ILP", "ILP-strata", "SparCC"),tab.final3) 
 rownames(tab.final3)<- c("", "", "total", "TP", "FP", "TN", "FN", "Sensivity", "Especificity", "Accuracy")
@@ -700,7 +697,7 @@ rownames(tab.final3)<- c("", "", "total", "TP", "FP", "TN", "FN", "Sensivity", "
 tab.final5<- cbind(getStats(rel.table.filt.opt[[3]], correct.tag, total.links),
                    getStats(rel.table.filt[[3]], correct.tag, total.links),
                    getStats(rel.table.filt.strata[[3]], correct.tag, total.links),
-                   getStats(sparcc.dfs[[3]][[2]], correct.tag, total.links),
+                   getStats(sparcc.dfs[[3]][[2]], correct.tag, total.links))
   
 tab.final5<- rbind(c("Strength 5", "", "", ""),c("Optimal", "ILP", "ILP-strata", "SparCC"),tab.final5) 
 rownames(tab.final5)<- c("", "", "total", "TP", "FP", "TN", "FN", "Sensivity", "Especificity", "Accuracy")
